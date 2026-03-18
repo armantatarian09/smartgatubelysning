@@ -3,7 +3,7 @@ import { Canvas, useFrame } from '@react-three/fiber';
 import { Line, OrbitControls, Stars, useCursor } from '@react-three/drei';
 import { BackSide, CatmullRomCurve3, DoubleSide, Vector3 } from 'three';
 
-const ROAD_LENGTH = 164;
+const ROAD_LENGTH = 140;
 const ROAD_START = 28;
 const PAIR_COUNT = 18;
 const PAIR_STEP = 8;
@@ -13,8 +13,34 @@ const HUB_POSITION = [0, 10.5, -44];
 const TRAFFIC_FRONT = 26;
 const TRAFFIC_SPAN = ROAD_LENGTH + 18;
 const COMMUNICATION_BEACON = [0, 7.2, -18];
+// Each pole gap represents roughly 100 meters, so a 1 km turn zone spans about 10 posts.
+const METERS_BETWEEN_LIGHT_POSTS = 100;
+const TURN_LIGHT_DISTANCE_METERS = 1000;
+const TURN_TRIGGER_DISTANCE_METERS = 320;
+const TURN_LIGHT_POSTS = TURN_LIGHT_DISTANCE_METERS / METERS_BETWEEN_LIGHT_POSTS;
+const TURN_ZONE_HALF_POSTS = Math.floor(TURN_LIGHT_POSTS / 2);
+const TURN_TRIGGER_WORLD = (TURN_TRIGGER_DISTANCE_METERS / METERS_BETWEEN_LIGHT_POSTS) * PAIR_STEP;
+const TRAFFIC_LOCAL_LIGHT_RANGE = 22;
+const TRAFFIC_FORWARD_LIGHT_RANGE = 78;
+const TRAFFIC_FORWARD_WAVE_RANGE = 118;
+const MAIN_ROAD_SURFACE_WIDTH = 12;
+const MAIN_ROAD_HALF_WIDTH = MAIN_ROAD_SURFACE_WIDTH / 2;
+const SIDEWALK_WIDTH = 3.6;
+const LOT_STRIP_WIDTH = 8.6;
+const SIDE_ROAD_LENGTH = 18.5;
+const SIDE_ROAD_WIDTH = 5.2;
+const SIDE_ROAD_JUNCTION_OVERLAP = 1.1;
+const SIDE_ROAD_JUNCTION_PATCH = 2.4;
+const SIDE_ROAD_LIGHT_OFFSETS = [4.2, 9.6, 15.2];
+const SIDE_ROAD_LIGHT_Z_OFFSETS = [-1.6, 1.6];
+const SIDE_ROAD_DASH_OFFSETS = [4.4, 9.8, 15.1];
+const OVERLAY_PAIR_RANGE = 2;
+const TURN_LAYOUTS = [
+  { id: 't-left', pair: 5, side: 'left' },
+  { id: 't-right', pair: 11, side: 'right' },
+];
 const TRAFFIC_CARS = [
-  { id: 'car-southbound', laneX: -2.05, speed: 0.078, offset: 0.12, color: '#ffc36f', direction: 'south' },
+  { id: 'car-southbound', laneX: -2.05, speed: 0.05, offset: 0.12, color: '#ffc36f', direction: 'south' },
 ];
 
 const popupContent = {
@@ -86,8 +112,12 @@ const popupContent = {
   },
 };
 
+function getPairZ(index) {
+  return ROAD_START - index * PAIR_STEP;
+}
+
 const roadPairs = Array.from({ length: PAIR_COUNT }, (_, index) => {
-  const z = ROAD_START - index * PAIR_STEP;
+  const z = getPairZ(index);
 
   return {
     pair: index,
@@ -98,6 +128,12 @@ const roadPairs = Array.from({ length: PAIR_COUNT }, (_, index) => {
     rightNode: [POLE_OFFSET - ARM_REACH, 4.1, z],
   };
 });
+
+const turnRoads = TURN_LAYOUTS.map((turn) => ({
+  ...turn,
+  z: getPairZ(turn.pair),
+  sideSign: turn.side === 'left' ? -1 : 1,
+}));
 
 const poles = roadPairs.flatMap((pair) => [
   {
@@ -140,6 +176,100 @@ function getNearestRoadPairIndex(z) {
   });
 
   return nearestIndex;
+}
+
+function getTrafficLightBoost(elapsedTime, pole) {
+  let strongest = 0;
+
+  TRAFFIC_CARS.forEach((car) => {
+    const carZ = getTrafficCarZ(elapsedTime, car);
+    const absoluteDistance = Math.abs(carZ - pole.position[2]);
+    const localBoost = Math.max(0, 1 - absoluteDistance / TRAFFIC_LOCAL_LIGHT_RANGE);
+    const forwardDistance = car.direction === 'north' ? pole.position[2] - carZ : carZ - pole.position[2];
+    const anticipationBoost = forwardDistance >= 0 ? Math.max(0, 1 - forwardDistance / TRAFFIC_FORWARD_LIGHT_RANGE) : 0;
+    const forwardWaveBoost = forwardDistance >= 0 ? Math.max(0, 1 - forwardDistance / TRAFFIC_FORWARD_WAVE_RANGE) : 0;
+    const aheadBoost = Math.max(anticipationBoost * 1.18, forwardWaveBoost * 0.72);
+
+    strongest = Math.max(strongest, Math.max(localBoost, aheadBoost));
+  });
+
+  return Math.min(1, strongest ** 1.55);
+}
+
+function getTurnApproachBoost(carZ, direction, turnZ) {
+  const forwardDistance = direction === 'north' ? turnZ - carZ : carZ - turnZ;
+
+  if (forwardDistance < -PAIR_STEP || forwardDistance > TURN_TRIGGER_WORLD) {
+    return 0;
+  }
+
+  return 1 - Math.max(forwardDistance, 0) / TURN_TRIGGER_WORLD;
+}
+
+function getTurnActivationLevel(elapsedTime, turn) {
+  let strongest = 0;
+
+  TRAFFIC_CARS.forEach((car) => {
+    const carZ = getTrafficCarZ(elapsedTime, car);
+    strongest = Math.max(strongest, getTurnApproachBoost(carZ, car.direction, turn.z));
+  });
+
+  return strongest;
+}
+
+function getGraphRamp(distance, activeRadius, power = 1.6) {
+  if (distance > activeRadius) {
+    return 0;
+  }
+
+  const normalized = 1 - distance / (activeRadius + 1);
+  return normalized ** power;
+}
+
+function getTurnLightBoost(elapsedTime, pole) {
+  let strongest = 0;
+
+  turnRoads.forEach((turn) => {
+    const approachLevel = getTurnActivationLevel(elapsedTime, turn);
+    if (approachLevel <= 0) {
+      return;
+    }
+
+    const activeRadius = 0.9 + approachLevel * (TURN_ZONE_HALF_POSTS - 0.2);
+    const postDelta = Math.abs(pole.pair - turn.pair);
+    const graphBoost = getGraphRamp(postDelta, activeRadius, 2.2);
+    strongest = Math.max(strongest, graphBoost * (0.26 + approachLevel * 0.86));
+  });
+
+  return strongest;
+}
+
+function getSideRoadLightBoost(elapsedTime, turn, offsetIndex) {
+  const approachLevel = getTurnActivationLevel(elapsedTime, turn);
+  if (approachLevel <= 0) {
+    return 0;
+  }
+
+  const activeRadius = 0.7 + approachLevel * (SIDE_ROAD_LIGHT_OFFSETS.length + 0.15);
+  const graphBoost = getGraphRamp(offsetIndex, activeRadius, 1.9);
+  return graphBoost * (0.24 + approachLevel * 0.84);
+}
+
+function getSideRoadCenterX(turn) {
+  return turn.sideSign * (MAIN_ROAD_HALF_WIDTH + SIDE_ROAD_LENGTH / 2 - SIDE_ROAD_JUNCTION_OVERLAP);
+}
+
+function getSideRoadJunctionCenterX(turn) {
+  return turn.sideSign * (MAIN_ROAD_HALF_WIDTH - SIDE_ROAD_JUNCTION_PATCH / 2);
+}
+
+function getSideRoadOffsetX(turn, offset) {
+  return turn.sideSign * (MAIN_ROAD_HALF_WIDTH + offset);
+}
+
+function smoothResponse(current, target, delta, brightenSpeed = 6.2, dimSpeed = 3.1) {
+  const speed = target > current ? brightenSpeed : dimSpeed;
+  return current + (target - current) * (1 - Math.exp(-delta * speed));
 }
 
 function NightBackdrop() {
@@ -201,32 +331,154 @@ function NightBackdrop() {
 function RoadAtmosphere() {
   return (
     <group>
-      {[-18, -38, -62, -86, -112].map((z, index) => (
-        <mesh key={z} position={[0, 1.4 + index * 0.16, z]} rotation={[-Math.PI / 2, 0, 0]}>
-          <planeGeometry args={[24 + index * 4, 12]} />
-          <meshBasicMaterial color="#7ce8ff" transparent opacity={0.045 + index * 0.007} />
+      {[-18, -50, -86].map((z, index) => (
+        <mesh key={z} position={[0, 1.1 + index * 0.14, z]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[22 + index * 6, 9 + index * 1.8]} />
+          <meshBasicMaterial color="#7ce8ff" transparent opacity={0.024 + index * 0.006} />
         </mesh>
       ))}
 
-      {[-8, -34, -58, -82].map((z, index) => (
-        <mesh key={`warm-${z}`} position={[0, 1.2 + index * 0.14, z]} rotation={[-Math.PI / 2, 0, 0]}>
-          <planeGeometry args={[20 + index * 3, 10]} />
-          <meshBasicMaterial color="#ffc36f" transparent opacity={0.028 + index * 0.004} />
+      {turnRoads.map((turn) => (
+        <mesh key={`turn-glow-${turn.id}`} position={[getSideRoadOffsetX(turn, 3.8), 0.32, turn.z]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[7.5, 6.5]} />
+          <meshBasicMaterial color={turn.side === 'left' ? '#7ce8ff' : '#ffc36f'} transparent opacity={0.06} />
         </mesh>
       ))}
 
       {[-10.5, 10.5].map((x) =>
-        [-20, -44, -70, -96].map((z, index) => (
-          <mesh key={`${x}-${z}`} position={[x, 0.55 + index * 0.08, z]} rotation={[-Math.PI / 2, 0, 0]}>
-            <planeGeometry args={[10 + index * 1.8, 7.5]} />
-            <meshBasicMaterial
-              color={x < 0 ? '#7ce8ff' : '#ffc36f'}
-              transparent
-              opacity={0.03 + index * 0.006}
-            />
+        [-24, -72].map((z, index) => (
+          <mesh key={`${x}-${z}`} position={[x, 0.4 + index * 0.08, z]} rotation={[-Math.PI / 2, 0, 0]}>
+            <planeGeometry args={[8.5 + index * 2, 5.8]} />
+            <meshBasicMaterial color={x < 0 ? '#7ce8ff' : '#ffc36f'} transparent opacity={0.018 + index * 0.005} />
           </mesh>
         )),
       )}
+    </group>
+  );
+}
+
+function SideRoadLamp({ turn, x, zOffset, offsetIndex }) {
+  const lampRef = useRef(null);
+  const beamRef = useRef(null);
+  const poolRef = useRef(null);
+  const dimLevelRef = useRef(0.04);
+
+  useFrame((state, delta) => {
+    if (!lampRef.current || !beamRef.current || !poolRef.current) {
+      return;
+    }
+
+    const boost = getSideRoadLightBoost(state.clock.elapsedTime, turn, offsetIndex);
+    const targetDimLevel = Math.min(1, 0.06 + boost * 1.08);
+    const dimLevel = smoothResponse(dimLevelRef.current, targetDimLevel, delta, 6.8, 2.4);
+    dimLevelRef.current = dimLevel;
+    const shimmer = 0.92 + Math.sin(state.clock.elapsedTime * 2.2 + offsetIndex + turn.pair * 0.3) * 0.08;
+
+    lampRef.current.material.emissiveIntensity = (0.12 + dimLevel * 2.05) * shimmer;
+    beamRef.current.material.opacity = (0.012 + dimLevel * 0.28) * shimmer;
+    beamRef.current.material.emissiveIntensity = 0.28 + dimLevel * 2.28;
+    poolRef.current.material.opacity = 0.012 + dimLevel * 0.25;
+    poolRef.current.scale.setScalar(0.66 + dimLevel * 0.62);
+  });
+
+  return (
+    <group position={[x, 0, turn.z + zOffset]}>
+      <mesh position={[0, 1.8, 0]} castShadow>
+        <cylinderGeometry args={[0.045, 0.065, 3.6, 16]} />
+        <meshStandardMaterial color="#587081" metalness={0.64} roughness={0.28} />
+      </mesh>
+
+      <mesh ref={lampRef} position={[0, 3.66, 0]} castShadow>
+        <boxGeometry args={[0.42, 0.12, 0.22]} />
+        <meshStandardMaterial color="#d8e5f2" emissive="#ffc36f" emissiveIntensity={0.2} />
+      </mesh>
+
+      <mesh ref={beamRef} position={[0, 1.58, 0]}>
+        <cylinderGeometry args={[0.08, 0.82, 3.05, 22, 1, true]} />
+        <meshStandardMaterial
+          color="#ffc36f"
+          emissive="#ffc36f"
+          emissiveIntensity={1}
+          transparent
+          opacity={0.12}
+          side={DoubleSide}
+        />
+      </mesh>
+
+      <mesh ref={poolRef} position={[0, 0.04, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <circleGeometry args={[0.9, 22]} />
+        <meshBasicMaterial color="#ffd39a" transparent opacity={0.06} />
+      </mesh>
+    </group>
+  );
+}
+
+function TJunctionRoad({ turn }) {
+  const centerX = getSideRoadCenterX(turn);
+  const junctionX = getSideRoadJunctionCenterX(turn);
+  const stopLineX = getSideRoadOffsetX(turn, 1.3);
+  const glowX = getSideRoadOffsetX(turn, 3.8);
+  const dashPositions = SIDE_ROAD_DASH_OFFSETS.map((offset) => getSideRoadOffsetX(turn, offset));
+
+  return (
+    <group>
+      <mesh position={[centerX, 0.012, turn.z]} rotation={[-Math.PI / 2, 0, 0]}>
+        <planeGeometry args={[SIDE_ROAD_LENGTH + 2.8, SIDE_ROAD_WIDTH + 2.4]} />
+        <meshBasicMaterial color="#17252f" transparent opacity={0.44} />
+      </mesh>
+
+      <mesh position={[junctionX, 0.019, turn.z]} rotation={[-Math.PI / 2, 0, 0]}>
+        <planeGeometry args={[SIDE_ROAD_JUNCTION_PATCH, SIDE_ROAD_WIDTH + 0.4]} />
+        <meshStandardMaterial color="#131f2a" roughness={0.72} metalness={0.1} />
+      </mesh>
+
+      <mesh position={[centerX, 0.018, turn.z]} rotation={[-Math.PI / 2, 0, 0]}>
+        <planeGeometry args={[SIDE_ROAD_LENGTH, SIDE_ROAD_WIDTH]} />
+        <meshStandardMaterial color="#15222d" roughness={0.74} metalness={0.12} />
+      </mesh>
+
+      <mesh position={[centerX, 0.008, turn.z]} rotation={[-Math.PI / 2, 0, 0]}>
+        <planeGeometry args={[SIDE_ROAD_LENGTH + 3, SIDE_ROAD_WIDTH + 3.2]} />
+        <meshBasicMaterial color="#0e2431" transparent opacity={0.12} />
+      </mesh>
+
+      {[-SIDE_ROAD_WIDTH / 2 + 0.16, SIDE_ROAD_WIDTH / 2 - 0.16].map((offset) => (
+        <mesh key={`${turn.id}-edge-${offset}`} position={[centerX, 0.032, turn.z + offset]}>
+          <boxGeometry args={[SIDE_ROAD_LENGTH, 0.02, 0.1]} />
+          <meshStandardMaterial color="#f1f7ff" emissive="#b7ecff" emissiveIntensity={0.42} />
+        </mesh>
+      ))}
+
+      <mesh position={[stopLineX, 0.05, turn.z]} rotation={[0, 0, 0]}>
+        <boxGeometry args={[0.16, 0.04, SIDE_ROAD_WIDTH - 0.9]} />
+        <meshStandardMaterial color="#f1f7ff" emissive="#d8ebf4" emissiveIntensity={0.3} />
+      </mesh>
+
+      {dashPositions.map((x) => (
+        <mesh key={`${turn.id}-dash-${x}`} position={[x, 0.05, turn.z]}>
+          <boxGeometry args={[1.7, 0.04, 0.18]} />
+          <meshStandardMaterial color="#ffd07e" emissive="#ffc46c" emissiveIntensity={0.92} />
+        </mesh>
+      ))}
+
+      {SIDE_ROAD_LIGHT_OFFSETS.map((offset, offsetIndex) => (
+        <group key={`${turn.id}-lights-${offset}`}>
+          {SIDE_ROAD_LIGHT_Z_OFFSETS.map((zOffset) => (
+            <SideRoadLamp
+              key={`${turn.id}-${offset}-${zOffset}`}
+              turn={turn}
+              x={getSideRoadOffsetX(turn, offset)}
+              zOffset={zOffset}
+              offsetIndex={offsetIndex}
+            />
+          ))}
+        </group>
+      ))}
+
+      <mesh position={[glowX, 0.03, turn.z]} rotation={[-Math.PI / 2, 0, 0]}>
+        <circleGeometry args={[1.6, 28]} />
+        <meshBasicMaterial color="#7ef0ff" transparent opacity={0.03} />
+      </mesh>
     </group>
   );
 }
@@ -238,6 +490,20 @@ function RoadSurface() {
         <planeGeometry args={[64, ROAD_LENGTH + 28]} />
         <meshStandardMaterial color="#061119" roughness={0.98} metalness={0.04} />
       </mesh>
+
+      {[-1, 1].map((sign) => (
+        <mesh key={`lot-strip-${sign}`} position={[sign * (MAIN_ROAD_HALF_WIDTH + SIDEWALK_WIDTH + LOT_STRIP_WIDTH / 2 - 0.3), 0.004, -38]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[LOT_STRIP_WIDTH, ROAD_LENGTH + 26]} />
+          <meshStandardMaterial color="#08141b" roughness={1} metalness={0.02} />
+        </mesh>
+      ))}
+
+      {[-1, 1].map((sign) => (
+        <mesh key={`sidewalk-${sign}`} position={[sign * (MAIN_ROAD_HALF_WIDTH + SIDEWALK_WIDTH / 2 + 0.8), 0.018, -38]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[SIDEWALK_WIDTH, ROAD_LENGTH + 18]} />
+          <meshStandardMaterial color="#253640" roughness={0.94} metalness={0.04} />
+        </mesh>
+      ))}
 
       <mesh position={[0, 0.02, -38]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
         <planeGeometry args={[12, ROAD_LENGTH]} />
@@ -269,6 +535,10 @@ function RoadSurface() {
         <meshBasicMaterial color="#9dd9ef" transparent opacity={0.05} />
       </mesh>
 
+      {turnRoads.map((turn) => (
+        <TJunctionRoad key={turn.id} turn={turn} />
+      ))}
+
       {[-4.8, 4.8].map((x) => (
         <mesh key={`road-edge-${x}`} position={[x, 0.03, -38]}>
           <boxGeometry args={[0.1, 0.02, ROAD_LENGTH]} />
@@ -283,12 +553,12 @@ function RoadSurface() {
         </mesh>
       ))}
 
-      {Array.from({ length: 22 }, (_, index) => {
-        const z = 20 - index * 7.4;
+      {Array.from({ length: 17 }, (_, index) => {
+        const z = 18 - index * 8.2;
         return (
           <mesh key={z} position={[0, 0.05, z]}>
-            <boxGeometry args={[0.24, 0.04, 3.4]} />
-            <meshStandardMaterial color="#ffd07e" emissive="#ffc46c" emissiveIntensity={1.4} />
+            <boxGeometry args={[0.22, 0.04, 2.7]} />
+            <meshStandardMaterial color="#ffd07e" emissive="#ffc46c" emissiveIntensity={1.08} />
           </mesh>
         );
       })}
@@ -300,8 +570,8 @@ function RoadSurface() {
         </mesh>
       ))}
 
-      {Array.from({ length: 18 }, (_, index) => {
-        const z = 24 - index * 8.8;
+      {Array.from({ length: 15 }, (_, index) => {
+        const z = 22 - index * 9.3;
         return (
           <group key={`reflector-${z}`}>
             <mesh position={[-5.6, 0.09, z]}>
@@ -319,64 +589,73 @@ function RoadSurface() {
   );
 }
 
+function CityBuilding({ building }) {
+  return (
+    <group position={[building.x, building.height / 2, building.z]}>
+      <mesh castShadow receiveShadow>
+        <boxGeometry args={[building.width, building.height, building.depth]} />
+        <meshStandardMaterial color={building.baseColor} metalness={0.16} roughness={0.84} />
+      </mesh>
+
+      <mesh position={[0, -building.height * 0.18, building.depth / 2 + 0.03]}>
+        <boxGeometry args={[building.width * 0.56, building.height * 0.16, 0.05]} />
+        <meshStandardMaterial color={building.windowColor} emissive={building.windowColor} emissiveIntensity={0.78} />
+      </mesh>
+
+      <mesh position={[0, building.height * 0.18, -building.depth / 2 - 0.03]}>
+        <boxGeometry args={[building.width * 0.42, building.height * 0.12, 0.05]} />
+        <meshStandardMaterial color={building.accentColor} emissive={building.accentColor} emissiveIntensity={0.42} />
+      </mesh>
+    </group>
+  );
+}
+
 function CityBlocks() {
+  const leftBuildings = [
+    { id: 'left-a', x: -17.4, z: 16, width: 6.2, height: 3.8, depth: 7.6, baseColor: '#0d2230', windowColor: '#e5f8ff', accentColor: '#8edfff' },
+    { id: 'left-b', x: -15.2, z: -6, width: 5.2, height: 5.4, depth: 6.2, baseColor: '#102532', windowColor: '#dff5ff', accentColor: '#88dfff' },
+    { id: 'left-c', x: -18.6, z: -34, width: 7.1, height: 3.3, depth: 8.4, baseColor: '#0e1e2a', windowColor: '#ffdba6', accentColor: '#ffc36f' },
+    { id: 'left-d', x: -15.8, z: -58, width: 4.8, height: 6.1, depth: 6.6, baseColor: '#122534', windowColor: '#e8f8ff', accentColor: '#7ce8ff' },
+    { id: 'left-e', x: -19.4, z: -92, width: 7.8, height: 4.2, depth: 8.8, baseColor: '#0c1c28', windowColor: '#ffdba6', accentColor: '#ffc36f' },
+  ];
+  const rightBuildings = [
+    { id: 'right-a', x: 17.2, z: 12, width: 5.8, height: 3.5, depth: 7.2, baseColor: '#102433', windowColor: '#ffd8a0', accentColor: '#ffc36f' },
+    { id: 'right-b', x: 15.6, z: -14, width: 4.6, height: 5.1, depth: 6.1, baseColor: '#0f2231', windowColor: '#e4f7ff', accentColor: '#8edfff' },
+    { id: 'right-c', x: 18.8, z: -42, width: 7, height: 3.2, depth: 8.2, baseColor: '#10212d', windowColor: '#ffdca0', accentColor: '#ffc36f' },
+    { id: 'right-d', x: 15.8, z: -72, width: 5.2, height: 5.8, depth: 6.4, baseColor: '#102433', windowColor: '#dff6ff', accentColor: '#7ce8ff' },
+    { id: 'right-e', x: 18.4, z: -102, width: 6.4, height: 4, depth: 8.4, baseColor: '#0d2230', windowColor: '#ffdba6', accentColor: '#ffc36f' },
+  ];
+
   return (
     <group>
-      {Array.from({ length: 14 }, (_, index) => {
-        const z = 24 - index * 12;
-        const width = 3 + (index % 3) * 0.8;
-        const height = 2.6 + (index % 4) * 1.2;
+      {[...leftBuildings, ...rightBuildings].map((building) => (
+        <mesh key={`pad-${building.id}`} position={[building.x, 0.03, building.z]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[building.width + 3.2, building.depth + 2.8]} />
+          <meshBasicMaterial color="#09131a" transparent opacity={0.45} />
+        </mesh>
+      ))}
 
-        return (
-          <group key={`left-${z}`} position={[-14 - (index % 2) * 2, height / 2, z - 4]}>
-            <mesh castShadow receiveShadow>
-              <boxGeometry args={[width, height, 5.5]} />
-              <meshStandardMaterial color="#0d2230" metalness={0.18} roughness={0.82} />
-            </mesh>
-            <mesh position={[0, 0.2, 2.76]}>
-              <boxGeometry args={[width * 0.72, height * 0.22, 0.04]} />
-              <meshStandardMaterial color="#7ce8ff" emissive="#7ce8ff" emissiveIntensity={1.25} />
-            </mesh>
-            <mesh position={[0, height * 0.34, -2.76]}>
-              <boxGeometry args={[width * 0.56, height * 0.16, 0.04]} />
-              <meshStandardMaterial color="#d3f7ff" emissive="#7ce8ff" emissiveIntensity={0.68} />
-            </mesh>
-          </group>
-        );
-      })}
+      {leftBuildings.map((building) => (
+        <CityBuilding key={building.id} building={building} />
+      ))}
 
-      {Array.from({ length: 14 }, (_, index) => {
-        const z = 18 - index * 12;
-        const width = 2.8 + (index % 2) * 1.1;
-        const height = 2.2 + (index % 5) * 1.1;
+      {rightBuildings.map((building) => (
+        <CityBuilding key={building.id} building={building} />
+      ))}
 
-        return (
-          <group key={`right-${z}`} position={[14 + (index % 2) * 2.4, height / 2, z]}>
-            <mesh castShadow receiveShadow>
-              <boxGeometry args={[width, height, 5.4]} />
-              <meshStandardMaterial color="#102433" metalness={0.22} roughness={0.8} />
-            </mesh>
-            <mesh position={[0, 0.15, -2.72]}>
-              <boxGeometry args={[width * 0.68, height * 0.22, 0.04]} />
-              <meshStandardMaterial color="#ffc36f" emissive="#ffc36f" emissiveIntensity={1.1} />
-            </mesh>
-            <mesh position={[0, height * 0.28, 2.72]}>
-              <boxGeometry args={[width * 0.54, height * 0.14, 0.04]} />
-              <meshStandardMaterial color="#ffdca0" emissive="#ffc36f" emissiveIntensity={0.58} />
-            </mesh>
-          </group>
-        );
-      })}
+      {turnRoads.map((turn) => (
+        <mesh key={`corner-lot-${turn.id}`} position={[getSideRoadCenterX(turn) + turn.sideSign * 1.8, 0.025, turn.z]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[SIDE_ROAD_LENGTH + 2.4, SIDE_ROAD_WIDTH + 5.4]} />
+          <meshBasicMaterial color="#0a161e" transparent opacity={0.24} />
+        </mesh>
+      ))}
 
-      {Array.from({ length: 9 }, (_, index) => {
-        const z = 18 - index * 18;
-        return (
-          <mesh key={`light-column-${z}`} position={[0, 6 + (index % 3) * 1.6, z]}>
-            <boxGeometry args={[0.08, 12 + (index % 2) * 3, 0.08]} />
-            <meshBasicMaterial color="#7ce8ff" transparent opacity={0.08} />
-          </mesh>
-        );
-      })}
+      {[-16, -52, -94].map((z, index) => (
+        <mesh key={`light-column-${z}`} position={[0, 5.2 + index * 1.2, z]}>
+          <boxGeometry args={[0.06, 9 + index * 2, 0.06]} />
+          <meshBasicMaterial color="#7ce8ff" transparent opacity={0.04} />
+        </mesh>
+      ))}
     </group>
   );
 }
@@ -503,6 +782,8 @@ function LampPost({ pole, active, onSelectFeature }) {
   const controllerRef = useRef(null);
   const cmsNodeRef = useRef(null);
   const cmsRingRef = useRef(null);
+  const dimLevelRef = useRef(0.08);
+  const visualBoostRef = useRef(0.08);
   const sign = pole.side === 'left' ? 1 : -1;
   const lampX = sign * 1.58;
   const lampY = 4.06;
@@ -512,7 +793,7 @@ function LampPost({ pole, active, onSelectFeature }) {
 
   useCursor(hovered);
 
-  useFrame((state) => {
+  useFrame((state, delta) => {
     if (
       !nodeRef.current ||
       !beamRef.current ||
@@ -528,38 +809,32 @@ function LampPost({ pole, active, onSelectFeature }) {
     }
 
     const shimmer = 0.88 + Math.sin(state.clock.elapsedTime * 3.1 + pole.pair * 0.4) * 0.12;
-    const trafficBoost = Math.max(
-      0,
-      ...TRAFFIC_CARS.map((car) => {
-        const carZ = getTrafficCarZ(state.clock.elapsedTime, car);
-        const absoluteDistance = Math.abs(carZ - pole.position[2]);
-        const localBoost = Math.max(0, 1 - absoluteDistance / 22);
-        const forwardDistance = car.direction === 'north' ? pole.position[2] - carZ : carZ - pole.position[2];
-        const anticipationBoost = forwardDistance >= 0 ? Math.max(0, 1 - forwardDistance / 58) : 0;
-
-        return Math.max(localBoost, anticipationBoost * 0.9);
-      }),
-    );
-    const reactiveBoost = trafficBoost ** 1.35;
-    const visualBoost = active ? 1 : hovered ? 0.88 : reactiveBoost;
-    const dimLevel = active ? 1 : hovered ? 0.92 : 0.1 + reactiveBoost * 0.9;
+    const trafficBoost = getTrafficLightBoost(state.clock.elapsedTime, pole);
+    const turnBoost = getTurnLightBoost(state.clock.elapsedTime, pole);
+    const reactiveBoost = Math.max(trafficBoost, turnBoost);
+    const targetVisualBoost = active ? 1 : hovered ? 0.94 : reactiveBoost;
+    const targetDimLevel = active ? 1 : hovered ? 0.96 : Math.min(1, 0.12 + reactiveBoost * 1.02);
+    const visualBoost = smoothResponse(visualBoostRef.current, targetVisualBoost, delta, 7.4, 3.1);
+    const dimLevel = smoothResponse(dimLevelRef.current, targetDimLevel, delta, 6.6, 2.6);
+    visualBoostRef.current = visualBoost;
+    dimLevelRef.current = dimLevel;
 
     nodeRef.current.scale.setScalar(0.92 + dimLevel * 0.66);
-    nodeRef.current.material.emissiveIntensity = (0.5 + dimLevel * 2.9) * shimmer;
-    lampRef.current.material.emissiveIntensity = 0.12 + dimLevel * 1.6;
-    beamRef.current.material.opacity = (0.028 + dimLevel * 0.34) * shimmer;
-    beamRef.current.material.emissiveIntensity = 0.45 + dimLevel * 2.2;
-    beamRef.current.scale.set(0.82 + dimLevel * 0.34, 0.55 + dimLevel * 0.92, 0.82 + dimLevel * 0.34);
-    poolRef.current.material.opacity = 0.018 + dimLevel * 0.25;
-    poolRef.current.scale.setScalar(0.74 + dimLevel * 0.72);
-    sensorRef.current.material.emissiveIntensity = 0.7 + visualBoost * 2.2;
-    sensorRingRef.current.scale.setScalar(0.9 + visualBoost * 0.46);
-    sensorRingRef.current.material.opacity = 0.12 + visualBoost * 0.42;
-    controllerRef.current.material.emissiveIntensity = 0.18 + visualBoost * 1.4;
-    cmsNodeRef.current.material.emissiveIntensity = 0.65 + visualBoost * 2;
+    nodeRef.current.material.emissiveIntensity = (0.36 + dimLevel * 3.25) * shimmer;
+    lampRef.current.material.emissiveIntensity = 0.1 + dimLevel * 1.95;
+    beamRef.current.material.opacity = (0.012 + dimLevel * 0.3) * shimmer;
+    beamRef.current.material.emissiveIntensity = 0.24 + dimLevel * 2.34;
+    beamRef.current.scale.set(0.72 + dimLevel * 0.3, 0.42 + dimLevel * 1.02, 0.72 + dimLevel * 0.3);
+    poolRef.current.material.opacity = 0.014 + dimLevel * 0.28;
+    poolRef.current.scale.setScalar(0.62 + dimLevel * 0.76);
+    sensorRef.current.material.emissiveIntensity = 0.52 + visualBoost * 2.18;
+    sensorRingRef.current.scale.setScalar(0.82 + visualBoost * 0.46);
+    sensorRingRef.current.material.opacity = 0.07 + visualBoost * 0.3;
+    controllerRef.current.material.emissiveIntensity = 0.12 + visualBoost * 1.28;
+    cmsNodeRef.current.material.emissiveIntensity = 0.42 + visualBoost * 1.92;
     cmsRingRef.current.rotation.z += 0.012;
-    cmsRingRef.current.scale.setScalar(0.92 + visualBoost * 0.38);
-    cmsRingRef.current.material.opacity = 0.1 + visualBoost * 0.42;
+    cmsRingRef.current.scale.setScalar(0.86 + visualBoost * 0.4);
+    cmsRingRef.current.material.opacity = 0.05 + visualBoost * 0.26;
   });
 
   return (
@@ -611,7 +886,7 @@ function LampPost({ pole, active, onSelectFeature }) {
           onSelectFeature('adaptive', pole.id);
         }}
       >
-        <cylinderGeometry args={[0.14, 1.26, 4.05, 30, 1, true]} />
+        <cylinderGeometry args={[0.12, 1.02, 3.72, 28, 1, true]} />
         <meshStandardMaterial
           color="#ffc36f"
           emissive="#ffc36f"
@@ -623,7 +898,7 @@ function LampPost({ pole, active, onSelectFeature }) {
       </mesh>
 
       <mesh ref={poolRef} position={[lampX, 0.04, 0]} rotation={[-Math.PI / 2, 0, 0]}>
-        <circleGeometry args={[1.28, 28]} />
+        <circleGeometry args={[1.08, 26]} />
         <meshBasicMaterial color="#ffd39a" transparent opacity={0.1} />
       </mesh>
 
@@ -746,7 +1021,7 @@ function NetworkHub({ pulse, onSelect }) {
     coreRef.current.rotation.y += 0.02;
     ringRef.current.rotation.x = 0.35 + Math.sin(state.clock.elapsedTime * 1.1) * 0.18;
     ringRef.current.rotation.z += 0.012;
-    coreRef.current.material.emissiveIntensity = pulse ? 3.1 : 1.8;
+    coreRef.current.material.emissiveIntensity = pulse ? 2.2 : 1.15;
   });
 
   return (
@@ -767,11 +1042,11 @@ function NetworkHub({ pulse, onSelect }) {
         }}
       >
         <icosahedronGeometry args={[0.56, 0]} />
-        <meshStandardMaterial color="#9df2ff" emissive="#7ef0ff" emissiveIntensity={2.1} />
+        <meshStandardMaterial color="#9df2ff" emissive="#7ef0ff" emissiveIntensity={1.5} />
       </mesh>
       <mesh ref={ringRef}>
         <torusGeometry args={[1.18, 0.06, 16, 72]} />
-        <meshBasicMaterial color="#7ef0ff" transparent opacity={0.28} />
+        <meshBasicMaterial color="#7ef0ff" transparent opacity={0.16} />
       </mesh>
       <mesh
         onPointerOver={(event) => {
@@ -831,15 +1106,15 @@ function SignalPacket({ points, trigger, delay = 0, speed = 0.55, color = '#7ef0
     bodyRef.current.position.copy(position);
     glowRef.current.position.copy(position);
     bodyRef.current.material.opacity = fade;
-    glowRef.current.material.opacity = 0.26 * fade;
-    glowRef.current.scale.setScalar(1.15 + Math.sin(state.clock.elapsedTime * 24) * 0.1);
+    glowRef.current.material.opacity = 0.18 * fade;
+    glowRef.current.scale.setScalar(1.05 + Math.sin(state.clock.elapsedTime * 20) * 0.08);
   });
 
   return (
     <>
       <mesh ref={glowRef}>
         <sphereGeometry args={[size * 2.6, 20, 20]} />
-        <meshBasicMaterial color={color} transparent opacity={0.22} />
+        <meshBasicMaterial color={color} transparent opacity={0.16} />
       </mesh>
       <mesh ref={bodyRef}>
         <sphereGeometry args={[size, 20, 20]} />
@@ -849,7 +1124,7 @@ function SignalPacket({ points, trigger, delay = 0, speed = 0.55, color = '#7ef0
   );
 }
 
-function TrafficAdaptiveSignals() {
+function TrafficAdaptiveSignals({ overlayActive }) {
   const detectRefs = useRef([]);
   const roadRefs = useRef([]);
   const hubRefs = useRef([]);
@@ -868,6 +1143,11 @@ function TrafficAdaptiveSignals() {
       const detectorProgress = (state.clock.elapsedTime * 2.7 + car.offset) % 1;
       const roadProgress = (state.clock.elapsedTime * 1.95 + car.offset * 1.4) % 1;
       const hubProgress = (state.clock.elapsedTime * 1.25 + car.offset * 0.7) % 1;
+      const turnSignal = Math.max(
+        0,
+        ...turnRoads.map((turn) => Math.max(0, 1 - Math.abs(turn.z - carZ) / 28) * getTurnActivationLevel(state.clock.elapsedTime, turn)),
+      );
+      const signalStrength = 0.18 + turnSignal * 0.82;
 
       const detectRef = detectRefs.current[index];
       const roadRef = roadRefs.current[index];
@@ -880,6 +1160,8 @@ function TrafficAdaptiveSignals() {
           carPoint[1] + (currentNode[1] - carPoint[1]) * detectorProgress,
           carPoint[2] + (currentNode[2] - carPoint[2]) * detectorProgress,
         );
+        detectRef.material.opacity = overlayActive ? 0.08 + signalStrength * 0.2 : 0;
+        detectRef.scale.setScalar(0.72 + signalStrength * 0.2);
       }
 
       if (roadRef) {
@@ -888,6 +1170,8 @@ function TrafficAdaptiveSignals() {
           currentNode[1] + (nextNode[1] - currentNode[1]) * roadProgress,
           currentNode[2] + (nextNode[2] - currentNode[2]) * roadProgress,
         );
+        roadRef.material.opacity = overlayActive ? 0.06 + signalStrength * 0.14 : 0;
+        roadRef.scale.setScalar(0.78 + signalStrength * 0.2);
       }
 
       if (hubRef) {
@@ -896,14 +1180,20 @@ function TrafficAdaptiveSignals() {
           currentNode[1] + (HUB_POSITION[1] - currentNode[1]) * hubProgress,
           currentNode[2] + (HUB_POSITION[2] - currentNode[2]) * hubProgress,
         );
+        hubRef.material.opacity = overlayActive ? 0.05 + signalStrength * 0.12 : 0;
+        hubRef.scale.setScalar(0.7 + signalStrength * 0.2);
       }
 
       if (glowRef) {
         glowRef.position.set(car.laneX, 0.08, carZ);
-        glowRef.material.opacity = 0.11 + Math.sin(state.clock.elapsedTime * 6 + index) * 0.03;
+        glowRef.material.opacity = overlayActive ? 0.018 + signalStrength * 0.04 + Math.sin(state.clock.elapsedTime * 6 + index) * 0.01 : 0;
       }
     });
   });
+
+  if (!overlayActive) {
+    return null;
+  }
 
   return (
     <group>
@@ -911,19 +1201,19 @@ function TrafficAdaptiveSignals() {
         <group key={car.id}>
           <mesh ref={(element) => { detectRefs.current[index] = element; }}>
             <sphereGeometry args={[0.12, 16, 16]} />
-            <meshBasicMaterial color="#ffc36f" />
+            <meshBasicMaterial color="#ffc36f" transparent opacity={0.12} />
           </mesh>
           <mesh ref={(element) => { roadRefs.current[index] = element; }}>
             <sphereGeometry args={[0.14, 16, 16]} />
-            <meshBasicMaterial color="#7ef0ff" />
+            <meshBasicMaterial color="#7ef0ff" transparent opacity={0.1} />
           </mesh>
           <mesh ref={(element) => { hubRefs.current[index] = element; }}>
             <sphereGeometry args={[0.12, 16, 16]} />
-            <meshBasicMaterial color="#7ef0ff" />
+            <meshBasicMaterial color="#7ef0ff" transparent opacity={0.1} />
           </mesh>
           <mesh ref={(element) => { glowRefs.current[index] = element; }} rotation={[-Math.PI / 2, 0, 0]}>
             <ringGeometry args={[0.9, 1.18, 32]} />
-            <meshBasicMaterial color={car.color} transparent opacity={0.12} side={DoubleSide} />
+            <meshBasicMaterial color={car.color} transparent opacity={0.05} side={DoubleSide} />
           </mesh>
         </group>
       ))}
@@ -931,105 +1221,106 @@ function TrafficAdaptiveSignals() {
   );
 }
 
-function CommunicationSystem({ activePoleId, signalTick }) {
+function CommunicationSystem({ activePoleId, signalTick, overlayActive }) {
+  if (!overlayActive || !activePoleId) {
+    return null;
+  }
+
   const activePole = poles.find((pole) => pole.id === activePoleId) ?? defaultPole;
   const leftPoints = roadPairs.map((pair) => pair.leftNode);
   const rightPoints = roadPairs.map((pair) => pair.rightNode);
   const sameSidePoints = activePole.side === 'left' ? leftPoints : rightPoints;
   const oppositeSidePoints = activePole.side === 'left' ? rightPoints : leftPoints;
   const sameIndex = activePole.pair;
+  const localStart = Math.max(sameIndex - OVERLAY_PAIR_RANGE, 0);
+  const localEnd = Math.min(sameIndex + OVERLAY_PAIR_RANGE, roadPairs.length - 1);
+  const localPairs = roadPairs.slice(localStart, localEnd + 1);
 
   const activeNode = activePole.node;
   const oppositeNode = activePole.side === 'left' ? roadPairs[sameIndex].rightNode : roadPairs[sameIndex].leftNode;
-  const towardsFront = sameSidePoints.slice(0, sameIndex + 1).reverse();
-  const towardsDepth = sameSidePoints.slice(sameIndex);
-  const oppositeTowardsFront = oppositeSidePoints.slice(0, sameIndex + 1).reverse();
-  const oppositeTowardsDepth = oppositeSidePoints.slice(sameIndex);
+  const towardsFront = sameSidePoints.slice(localStart, sameIndex + 1).reverse();
+  const towardsDepth = sameSidePoints.slice(sameIndex, localEnd + 1);
+  const oppositeTowardsFront = oppositeSidePoints.slice(localStart, sameIndex + 1).reverse();
+  const oppositeTowardsDepth = oppositeSidePoints.slice(sameIndex, localEnd + 1);
   const hubPath = [
     activeNode,
-    [activeNode[0] * 0.55, 6.8, activeNode[2] - 6],
+    [activeNode[0] * 0.4, 6.2, activeNode[2] - 4.5],
     HUB_POSITION,
   ];
 
   return (
     <group>
-      <Line points={leftPoints} color="#143a4c" transparent opacity={0.48} lineWidth={1.2} />
-      <Line points={rightPoints} color="#143a4c" transparent opacity={0.48} lineWidth={1.2} />
+      <Line points={leftPoints.slice(localStart, localEnd + 1)} color="#173547" transparent opacity={0.18} lineWidth={0.85} />
+      <Line points={rightPoints.slice(localStart, localEnd + 1)} color="#173547" transparent opacity={0.18} lineWidth={0.85} />
 
-      {roadPairs.map((pair) => (
+      {localPairs.map((pair) => (
         <Line
           key={pair.pair}
           points={[pair.leftNode, pair.rightNode]}
           color={pair.pair === sameIndex ? '#7ef0ff' : '#173949'}
           transparent
-          opacity={pair.pair === sameIndex ? 0.7 : 0.24}
-          lineWidth={1.1}
+          opacity={pair.pair === sameIndex ? 0.38 : 0.1}
+          lineWidth={0.72}
         />
       ))}
 
-      {roadPairs.filter((pair) => pair.pair % 4 === 0).map((pair) => (
-        <Line
-          key={`hub-${pair.pair}`}
-          points={[
-            [(pair.leftNode[0] + pair.rightNode[0]) / 2, 5.4, pair.z],
-            [0, 7.4, pair.z - 4],
-            HUB_POSITION,
-          ]}
-          color="#113244"
-          transparent
-          opacity={0.16}
-          lineWidth={0.8}
-        />
-      ))}
+      <Line points={hubPath} color="#143547" transparent opacity={0.16} lineWidth={0.74} />
 
-      <SignalPacket points={[activeNode, oppositeNode]} trigger={signalTick} speed={1.2} color="#7ef0ff" size={0.18} />
-      <SignalPacket points={towardsFront} trigger={signalTick} delay={0.15} speed={0.48} color="#ffc36f" />
-      <SignalPacket points={towardsDepth} trigger={signalTick} delay={0.2} speed={0.48} color="#ffc36f" />
-      <SignalPacket points={oppositeTowardsFront} trigger={signalTick} delay={0.45} speed={0.44} color="#7ef0ff" />
-      <SignalPacket points={oppositeTowardsDepth} trigger={signalTick} delay={0.5} speed={0.44} color="#7ef0ff" />
-      <SignalPacket points={hubPath} trigger={signalTick} delay={0.1} speed={0.68} color="#7ef0ff" size={0.2} />
+      <SignalPacket points={[activeNode, oppositeNode]} trigger={signalTick} speed={1.05} color="#7ef0ff" size={0.14} />
+      <SignalPacket points={towardsFront} trigger={signalTick} delay={0.12} speed={0.46} color="#ffc36f" size={0.12} />
+      <SignalPacket points={towardsDepth} trigger={signalTick} delay={0.18} speed={0.46} color="#ffc36f" size={0.12} />
+      <SignalPacket points={oppositeTowardsFront} trigger={signalTick} delay={0.36} speed={0.42} color="#7ef0ff" size={0.12} />
+      <SignalPacket points={oppositeTowardsDepth} trigger={signalTick} delay={0.42} speed={0.42} color="#7ef0ff" size={0.12} />
+      <SignalPacket points={hubPath} trigger={signalTick} delay={0.08} speed={0.6} color="#7ef0ff" size={0.16} />
     </group>
   );
 }
 
-function Experience({ activePoleId, signalTick, onSelectFeature }) {
+function Experience({ activePoleId, signalTick, overlayActive, onSelectFeature }) {
   return (
     <>
       <color attach="background" args={['#041019']} />
       <fog attach="fog" args={['#041019', 24, 132]} />
-      <ambientLight intensity={0.72} />
-      <hemisphereLight color="#d0ebff" groundColor="#031018" intensity={1.16} />
+      <ambientLight intensity={0.58} />
+      <hemisphereLight color="#d0ebff" groundColor="#031018" intensity={0.92} />
       <directionalLight
-        position={[12, 16, 10]}
-        intensity={1.88}
+        position={[15, 18, 10]}
+        intensity={1.46}
         color="#ffd79e"
         castShadow
         shadow-mapSize-width={2048}
         shadow-mapSize-height={2048}
         shadow-camera-near={1}
-        shadow-camera-far={80}
-        shadow-camera-left={-34}
-        shadow-camera-right={34}
-        shadow-camera-top={34}
-        shadow-camera-bottom={-34}
+        shadow-camera-far={96}
+        shadow-camera-left={-30}
+        shadow-camera-right={30}
+        shadow-camera-top={30}
+        shadow-camera-bottom={-30}
       />
-      <directionalLight position={[-18, 10, -24]} intensity={0.46} color="#8fe7ff" />
-      <spotLight position={[0, 18, 4]} angle={0.46} penumbra={0.65} intensity={0.62} color="#86e9ff" />
-      <pointLight position={[0, 8, -20]} intensity={1.72} color="#7ef0ff" />
-      <pointLight position={[0, 6, -78]} intensity={1.2} color="#ffc36f" />
-      <pointLight position={[-18, 14, -90]} intensity={0.8} color="#7ce8ff" />
-      <pointLight position={[18, 12, -32]} intensity={0.65} color="#ffc36f" />
+      <directionalLight position={[-18, 10, -24]} intensity={0.26} color="#8fe7ff" />
+      <spotLight position={[0, 18, 2]} angle={0.42} penumbra={0.7} intensity={0.36} color="#86e9ff" />
+      <pointLight position={[0, 7, -26]} intensity={0.72} color="#7ef0ff" />
+      <pointLight position={[0, 6, -78]} intensity={0.56} color="#ffc36f" />
+      {turnRoads.map((turn) => (
+        <pointLight
+          key={`turn-light-${turn.id}`}
+          position={[getSideRoadOffsetX(turn, 5.8), 3.6, turn.z]}
+          intensity={0.42}
+          distance={22}
+          color={turn.side === 'left' ? '#7ce8ff' : '#ffc36f'}
+        />
+      ))}
 
-      <Stars radius={180} depth={120} count={1800} factor={4.2} saturation={0} speed={0.5} fade />
+      <Stars radius={170} depth={110} count={1200} factor={3.4} saturation={0} speed={0.16} fade />
 
       <NightBackdrop />
       <RoadAtmosphere />
       <RoadSurface />
       <CityBlocks />
-      <NetworkHub pulse onSelect={() => onSelectFeature('cms', activePoleId)} />
+      <NetworkHub pulse={overlayActive} onSelect={() => onSelectFeature('cms', activePoleId)} />
       <CommunicationBeacon onSelect={() => onSelectFeature('communication', activePoleId)} />
-      <CommunicationSystem activePoleId={activePoleId} signalTick={signalTick} />
-      <TrafficAdaptiveSignals />
+      <CommunicationSystem activePoleId={activePoleId} signalTick={signalTick} overlayActive={overlayActive} />
+      <TrafficAdaptiveSignals overlayActive={overlayActive} />
 
       {poles.map((pole) => (
         <LampPost
@@ -1053,20 +1344,21 @@ function Experience({ activePoleId, signalTick, onSelectFeature }) {
         enablePan={false}
         enableDamping
         dampingFactor={0.08}
-        minDistance={16}
-        maxDistance={96}
-        minPolarAngle={0.42}
-        maxPolarAngle={1.42}
-        target={[0, 4.4, -42]}
+        minDistance={18}
+        maxDistance={64}
+        minPolarAngle={0.56}
+        maxPolarAngle={1.22}
+        target={[0, 3.8, -34]}
       />
     </>
   );
 }
 
 function App() {
-  const [activePoleId, setActivePoleId] = useState(defaultPole.id);
+  const [activePoleId, setActivePoleId] = useState(null);
   const [signalTick, setSignalTick] = useState(1);
   const [popupState, setPopupState] = useState(null);
+  const overlayActive = popupState !== null;
 
   const activePole = poles.find((pole) => pole.id === activePoleId) ?? defaultPole;
   const popup = popupState ? popupContent[popupState.feature] : null;
@@ -1083,14 +1375,14 @@ function App() {
       <Canvas
         shadows
         dpr={[1, 1.8]}
-        camera={{ position: [0, 12, 28], fov: 42 }}
+        camera={{ position: [18, 11, 18], fov: 38 }}
         onPointerMissed={() => {
           setActivePoleId(null);
           setPopupState(null);
         }}
       >
         <Suspense fallback={null}>
-          <Experience activePoleId={activePoleId} signalTick={signalTick} onSelectFeature={handleSelectFeature} />
+          <Experience activePoleId={activePoleId} signalTick={signalTick} overlayActive={overlayActive} onSelectFeature={handleSelectFeature} />
         </Suspense>
       </Canvas>
 
